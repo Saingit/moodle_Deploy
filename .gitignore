@@ -1,0 +1,10 @@
+# Nunca subir el .env real (contiene contraseñas y datos sensibles)
+.env
+
+# Certificados TLS (cuando se añadan en fase de producción)
+nginx/certs/*
+!nginx/certs/.gitkeep
+
+# Archivos del sistema
+.DS_Store
+*.log
