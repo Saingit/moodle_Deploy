@@ -1,0 +1,188 @@
+version: "3.9"
+
+# =============================================================================
+# Stack de producción: Moodle 5.1 LMS
+# Arquitectura: Nginx (web) -> PHP-FPM 8.3 (app) -> PostgreSQL 18 (datos)
+# + servicio dedicado de cron de Moodle.
+# Host de referencia: Ubuntu Server 26.04
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # 1. BASE DE DATOS — PostgreSQL 18
+  # ---------------------------------------------------------------------------
+  db:
+    image: postgres:18
+    container_name: moodle_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${MOODLE_DATABASE_NAME}
+      TZ: ${TZ}
+    volumes:
+      # IMPORTANTE: desde la imagen oficial de Postgres 18 el VOLUME pasó de
+      # /var/lib/postgresql/data a /var/lib/postgresql (path versionado
+      # internamente, ej. /var/lib/postgresql/18/docker). Monta el volumen
+      # en la ruta padre, NO en /data, o el contenedor no iniciará.
+      - db_data:/var/lib/postgresql
+    networks:
+      - backend
+    # No se publica ningún puerto al host: solo es alcanzable desde la red
+    # interna "backend" por nombre de servicio ("db").
+    shm_size: "256mb" # mejora rendimiento en ordenamientos/joins grandes
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1g
+        reservations:
+          memory: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${MOODLE_DATABASE_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # 2. PROCESAMIENTO PHP — PHP 8.3-FPM con extensiones Moodle
+  # ---------------------------------------------------------------------------
+  php:
+    build:
+      context: ./php
+      dockerfile: Dockerfile
+    image: moodle_php:8.3-fpm
+    container_name: moodle_php
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ}
+      # Nota: los límites de memoria/subida de PHP se definen en
+      # php/php.ini (no son interpolables vía variables de entorno aquí);
+      # edítalos ahí y reconstruye la imagen si necesitas cambiarlos.
+      #
+      # Las siguientes SÍ se inyectan como entorno porque las consume
+      # directamente php/install-moodle.sh durante la primera instalación
+      # (admin/cli/install.php) y, vía config.php generado por Moodle, la
+      # conexión a base de datos en cada request.
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      MOODLE_DATABASE_NAME: ${MOODLE_DATABASE_NAME}
+      MOODLE_SITE_URL: ${MOODLE_SITE_URL}
+      MOODLE_ADMIN_USER: ${MOODLE_ADMIN_USER}
+      MOODLE_ADMIN_PASSWORD: ${MOODLE_ADMIN_PASSWORD}
+      MOODLE_ADMIN_EMAIL: ${MOODLE_ADMIN_EMAIL}
+    volumes:
+      # Código de Moodle compartido con Nginx (Nginx solo necesita leer
+      # estáticos; PHP necesita lectura/escritura para actualizaciones/plugins).
+      - moodle_html:/var/www/html
+      # moodledata: NUNCA debe estar dentro del docroot ni ser accesible vía
+      # web. Se monta como volumen independiente. El propietario debe ser
+      # www-data (uid/gid 33, el mismo del usuario que ejecuta php-fpm) para
+      # que Moodle pueda crear/escribir caches, sesiones y archivos subidos.
+      - moodledata:/var/www/moodledata
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1g
+        reservations:
+          memory: 512m
+
+  # ---------------------------------------------------------------------------
+  # 3. SERVIDOR WEB — Nginx (único punto de entrada expuesto al exterior)
+  # ---------------------------------------------------------------------------
+  web:
+    image: nginx:1.27-alpine
+    container_name: moodle_web
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ}
+    volumes:
+      # Mismo volumen de código que PHP, pero Nginx solo lo necesita en
+      # modo lectura para servir estáticos (CSS/JS/imágenes) y pasar el
+      # resto a PHP-FPM vía FastCGI.
+      - moodle_html:/var/www/html:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      # En esta fase de laboratorio no se monta TLS. Cuando pases a
+      # producción con dominio propio, vuelve a añadir aquí el volumen de
+      # certificados (./nginx/certs:/etc/nginx/certs:ro) y habilita el
+      # bloque "listen 443 ssl" en nginx/conf.d/moodle.conf.
+    ports:
+      # Único servicio del stack con puertos publicados al host.
+      # Solo 80: laboratorio en intranet, acceso por IP, sin TLS todavía.
+      - "80:80"
+    depends_on:
+      - php
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256m
+
+  # ---------------------------------------------------------------------------
+  # 4. CRON DE MOODLE — ejecuta cron.php cada minuto en un contenedor aislado
+  # ---------------------------------------------------------------------------
+  cron:
+    build:
+      context: ./php
+      dockerfile: Dockerfile
+    image: moodle_php:8.3-fpm
+    container_name: moodle_cron
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ}
+    volumes:
+      # Mismos volúmenes que el contenedor PHP: cron.php necesita acceso
+      # completo al código y a moodledata para procesar tareas programadas.
+      - moodle_html:/var/www/html
+      - moodledata:/var/www/moodledata
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - backend
+    # Se sobreescribe el entrypoint/CMD de la imagen para que este contenedor
+    # NO levante php-fpm, sino que ejecute un bucle de cron cada 60s. Esto
+    # mantiene una única responsabilidad por contenedor (principio de
+    # contenedor = 1 proceso) y evita instalar un cron daemon del sistema.
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "while true; do
+        php /var/www/html/admin/cli/cron.php >> /var/www/moodledata/cron.log 2>&1;
+        sleep 60;
+      done"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512m
+
+# =============================================================================
+# REDES
+# =============================================================================
+networks:
+  backend:
+    driver: bridge
+    internal: false
+    # "internal: false" para permitir que PHP haga llamadas salientes
+    # (ej. servicios externos, envío de correo, actualizaciones). Si tu caso
+    # de uso no lo requiere, cámbialo a "true" para mayor aislamiento: así
+    # ningún contenedor de este stack podría iniciar tráfico hacia internet.
+
+# =============================================================================
+# VOLÚMENES NOMBRADOS (persistencia)
+# =============================================================================
+volumes:
+  db_data:        # Datos de PostgreSQL (cluster completo)
+  moodle_html:     # Código fuente de Moodle (core + plugins)
+  moodledata:      # Carpeta de datos de Moodle (uploads, caches, sesiones)
