@@ -4,7 +4,11 @@
 # =============================================================================
 FROM php:8.3-fpm
 
-# Dependencias de sistema necesarias para compilar/usar las extensiones PHP
+# Dependencias de sistema necesarias para compilar/usar las extensiones PHP.
+# Se incluye "locales" para poder generar los locales que Moodle necesita
+# (es_CO.UTF-8 y en_US.UTF-8); sin esto, Moodle solo encuentra C/C.utf8/POSIX
+# y cae al locale global del sistema host (ej. en_AU.UTF-8) para fechas y
+# formato de números.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     libxml2-dev \
@@ -20,7 +24,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
     git \
     postgresql-client \
-    && rm -rf /var/lib/apt/lists/*
+    locales \
+    && rm -rf /var/lib/apt/lists/*s
+
+# Generación de locales: Debian no trae locales generados por defecto (solo
+# C/C.utf8/POSIX) para no inflar la imagen con todos los idiomas posibles.
+# Hay que descomentar explícitamente las líneas deseadas en /etc/locale.gen
+# y correr locale-gen. Se generan es_CO.UTF-8 (español Colombia, idioma
+# principal del sitio) y en_US.UTF-8 (inglés, idioma base de Moodle/fallback).
+RUN sed -i -e 's/# es_CO.UTF-8 UTF-8/es_CO.UTF-8 UTF-8/' \
+           -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen \
+    && locale-gen
+
+# Variables de entorno de locale por defecto del sistema dentro del
+# contenedor. Moodle internamente usa su propio selector de idioma por
+# usuario/sitio, pero estas variables son las que consultan funciones de PHP
+# como setlocale()/strftime() cuando Moodle no especifica un locale exacto.
+ENV LANG=es_CO.UTF-8 \
+    LANGUAGE=es_CO:en_US \
+    LC_ALL=es_CO.UTF-8
 
 # Extensiones requeridas/recomendadas por Moodle:
 # pgsql (BD), gd (imágenes), intl (i18n), mbstring (cadenas), xml/xsl,
