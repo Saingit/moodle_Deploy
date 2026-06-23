@@ -35,7 +35,13 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "2.0"
+          # Host de 1 sola vCPU: "cpus" es una cuota de tiempo de CPU, no un
+          # núcleo reservado en exclusiva, así que varios servicios pueden
+          # convivir sumando más de 1.0 (Docker hace time-slicing). Lo que sí
+          # exige Docker es que ningún servicio individual pida más que el
+          # total físico disponible (1.00). PostgreSQL es el más intensivo en
+          # CPU bajo carga (queries/joins), por eso recibe la cuota más alta.
+          cpus: "0.50"
           memory: 1g
         reservations:
           memory: 512m
@@ -91,7 +97,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "2.0"
+          # Segundo servicio más exigente: ejecuta toda la lógica de Moodle.
+          cpus: "0.40"
           memory: 1g
         reservations:
           memory: 512m
@@ -126,7 +133,9 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "1.0"
+          # Nginx solo sirve estáticos y hace proxy a PHP-FPM: es el más
+          # liviano del stack en consumo de CPU.
+          cpus: "0.10"
           memory: 256m
 
   # ---------------------------------------------------------------------------
@@ -164,7 +173,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "1.0"
+          # Corre en ráfagas cada 60s, no consume CPU de forma constante.
+          cpus: "0.20"
           memory: 512m
 
 # =============================================================================
